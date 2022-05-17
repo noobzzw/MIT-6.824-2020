@@ -1,10 +1,13 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
-
+import (
+	"fmt"
+	"hash/fnv"
+	"log"
+	"net/rpc"
+	"os/exec"
+	"time"
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -24,17 +27,56 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	data, err := exec.Command("uuidgen").Output()
+	if err != nil {
+		log.Fatal("gen worker id error:", err)
+	}
+	workerId := string(data)
+	// 不断像master发送心跳，轮询任务
+	for {
+		response := doHearBeat(workerId)
+		fmt.Println(response)
+		switch response.JobType {
+		case MapTask:
+			// do map
+			doMap(mapf, response)
+		case ReduceTask:
+			doReduce(reducef, response)
+		case Wait:
+			// Wait 5 second
+			time.Sleep(5 * time.Second)
+		case CompleteTask:
+			// all done
+			fmt.Println("我滴任务完成啦！")
+			return
+		}
+		time.Sleep(5 * time.Second)
+	}
 
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the master.
 	// CallExample()
+
+}
+
+func doHearBeat(workerId string) TaskResponse {
+	// 像master发送心跳，请求任务
+	taskRequest := TaskRequest{workerId}
+	taskResponse := TaskResponse{}
+	call("Master.GetTask", &taskRequest, &taskResponse)
+	return taskResponse
+}
+
+func doReduce(reducef func(string, []string) string, response TaskResponse) {
+}
+
+func doMap(mapf func(string, string) []KeyValue, response TaskResponse) {
 
 }
 
