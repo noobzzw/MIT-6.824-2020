@@ -1,11 +1,14 @@
 package mr
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log"
 	"net/rpc"
-	"os/exec"
+	"os"
+	"sort"
 	"time"
 )
 
@@ -16,6 +19,20 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+type WorkerInfo struct {
+	MapFunc    func(string, string) []KeyValue
+	ReduceFunc func(string, []string) string
+	Task       *Task
+}
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -30,24 +47,27 @@ func ihash(key string) int {
 //
 // main/mrworker.go calls this function.
 //
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
-	data, err := exec.Command("uuidgen").Output()
-	if err != nil {
-		log.Fatal("gen worker id error:", err)
+	w := WorkerInfo{
+		MapFunc:    mapf,
+		ReduceFunc: reducef,
+		Task:       &Task{},
 	}
-	workerId := string(data)
+
 	// 不断像master发送心跳，轮询任务
 	for {
-		response := doHearBeat(workerId)
-		fmt.Println(response)
-		switch response.JobType {
+		response := w.doHearBeat()
+		fmt.Println("receive task : ", response.Task.TaskIndex, ", task type is ", GetTaskTypeName(response.Task.TaskType))
+		switch response.Task.TaskType {
 		case MapTask:
 			// do map
-			doMap(mapf, response)
+			w.Map()
 		case ReduceTask:
-			doReduce(reducef, response)
+			w.Reduce()
 		case Wait:
+			// Wait表示Worker需等待指令（例如其他Worker的Map任务还未完成）
 			// Wait 5 second
 			time.Sleep(5 * time.Second)
 		case CompleteTask:
@@ -55,29 +75,191 @@ func Worker(mapf func(string, string) []KeyValue,
 			fmt.Println("我滴任务完成啦！")
 			return
 		}
-		time.Sleep(5 * time.Second)
+		//sleepTime := rand.Intn(10)
+		//time.Sleep(time.Duration(sleepTime) * time.Second)
 	}
-
-	// Your worker implementation here.
-
-	// uncomment to send the Example RPC to the master.
-	// CallExample()
-
 }
 
-func doHearBeat(workerId string) TaskResponse {
-	// 像master发送心跳，请求任务
-	taskRequest := TaskRequest{workerId}
+// 获取任务信息
+func (w *WorkerInfo) doHearBeat() TaskResponse {
 	taskResponse := TaskResponse{}
+	taskRequest := TaskRequest{*w.Task}
+	// 如果为空结构体或当前Worker分配的Task已完成，则继续向Master请求任务
 	call("Master.GetTask", &taskRequest, &taskResponse)
+	// 更新当前task信息
+	w.Task = &taskResponse.Task
 	return taskResponse
 }
 
-func doReduce(reducef func(string, []string) string, response TaskResponse) {
+// 上报任务信息
+func (w *WorkerInfo) Report() {
+	// 更新任务的时间戳
+	w.Task.HearBeat = time.Now()
+	taskResponse := TaskResponse{}
+	taskRequest := TaskRequest{*w.Task}
+	// 汇报任务情况
+	call("Master.ReportTask", &taskRequest, &taskResponse)
 }
 
-func doMap(mapf func(string, string) []KeyValue, response TaskResponse) {
+// 执行reduceTask
+func (w *WorkerInfo) Reduce() {
+	// open file
+	reduceIndex := w.Task.TaskIndex
+	outName := fmt.Sprintf("mr-out-%v", reduceIndex)
+	format := "mr-%v-%v"
+	intermediate := make([]KeyValue, 0)
+	for i := 0; i < w.Task.MapNum; i++ {
+		/* ---copy file --- */
+		fileName := fmt.Sprintf(format, i, reduceIndex)
+		file, err := os.Open(fileName)
+		if err != nil {
+			log.Fatalf("cannot open %v", w.Task.File)
+		}
+		dec := json.NewDecoder(file)
+		kva := make([]KeyValue, 0)
+		for {
+			var kv KeyValue
+			err = dec.Decode(&kv)
+			if err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		err = file.Close()
+		if err != nil {
+			log.Fatalf("cannot close %v", file.Name())
+		}
+		// ... 代表将当前集合unpack后append进result
+		intermediate = append(intermediate, kva...)
+	}
+	/* ---- sort --- */
+	sort.Sort(ByKey(intermediate))
+	/* --- reduce --*/
+	w.doReduce(intermediate, outName)
+	w.Task.IsFinish = true
+	w.Task.HasAssigned = true
+	// 上报任务信息
+	w.Report()
+}
 
+func (w *WorkerInfo) doReduce(intermediate []KeyValue, outName string) {
+	tempFile, err := os.CreateTemp(".", "mrtemp")
+	if err != nil {
+		log.Fatalf("cannot create tempfile for %v\n", outName)
+	}
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		var values []string
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := w.ReduceFunc(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		_, err := fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+		if err != nil {
+			log.Fatalf("write tempfile failed for %v\n", outName)
+		}
+		i = j
+	}
+	/* --rename temp file to official file */
+	// 先检测文件是否存在，如果存在则删除（预防其他crash任务已写入部分文件）
+	_, err = os.Stat(outName)
+	if err == nil {
+		// 如果文件存在，则删除
+		err := os.Remove(outName)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+	err = os.Rename(tempFile.Name(), outName)
+	if err != nil {
+		log.Fatalf("rename tempfile failed for %v\n", outName)
+	}
+}
+
+// 执行MapTask
+func (w *WorkerInfo) Map() {
+	reduceNum := w.Task.ReduceNum
+	/* -----map---------- */
+	// 执行Map函数
+	kva := w.doMap()
+	/* -----partition---- */
+	// 存储分区后的[]kv
+	partitionedKva := make([][]KeyValue, reduceNum)
+	// 初始化partitionKva
+	for i := 0; i < reduceNum; i++ {
+		partitionedKva[i] = make([]KeyValue, 0)
+	}
+	for _, value := range kva {
+		// 计算分区数
+		index := ihash(value.Key) % reduceNum
+		partitionedKva[index] = append(partitionedKva[index], value)
+	}
+	/* -----sort--------- */
+	for i := 0; i < reduceNum; i++ {
+		sort.Sort(ByKey(partitionedKva[i]))
+	}
+	/* --write intermediate file-- */
+	for i := 0; i < reduceNum; i++ {
+		tempFile, err := os.CreateTemp(".", "mrtemp")
+		if err != nil {
+			log.Fatal(err)
+		}
+		enc := json.NewEncoder(tempFile)
+		for _, kv := range partitionedKva[i] {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		outName := fmt.Sprintf("mr-%v-%v", w.Task.TaskIndex, i)
+		_, err = os.Stat(outName)
+		if err == nil {
+			// 如果文件存在，则删除
+			err := os.Remove(outName)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
+		err = os.Rename(tempFile.Name(), outName)
+		if err != nil {
+			fmt.Printf("rename tempfile failed for %v\n", outName)
+		}
+	}
+	//for {
+	//}
+	w.Task.IsFinish = true
+	w.Task.HasAssigned = true
+	// 上报任务信息
+	w.Report()
+}
+
+// 执行Map函数
+func (w *WorkerInfo) doMap() []KeyValue {
+	path := w.Task.File
+	// test script manages relative path structure
+	// open file
+	file, err := os.Open(path)
+	if err != nil {
+		log.Fatalf("cannot open %v", path)
+	}
+	// read file content
+	content, err := io.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read file %v", w.Task.File)
+	}
+	err = file.Close()
+	if err != nil {
+		return nil
+	}
+	// generate kv array
+	kva := w.MapFunc(w.Task.File, string(content))
+	return kva
 }
 
 //

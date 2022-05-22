@@ -24,6 +24,8 @@ type ExampleReply struct {
 	Y int
 }
 
+// Add your RPC definitions here.
+// 任务类型
 type taskType int
 
 const (
@@ -33,23 +35,32 @@ const (
 	CompleteTask
 )
 
-// TaskRequest worke的请求
+func GetTaskTypeName(code taskType) (typeName string) {
+
+	switch code {
+	case MapTask:
+		typeName = "MapTask"
+	case ReduceTask:
+		typeName = "ReduceTask"
+	case Wait:
+		typeName = "Wait"
+	case CompleteTask:
+		typeName = "CompleteTask"
+	}
+	return
+}
+
+// TaskRequest worker的请求
 type TaskRequest struct {
-	// 当前worker的id
-	WorkerId string
+	// task信息
+	Task Task
 }
 
 // TaskResponse hearbeat response
 type TaskResponse struct {
 	// task 当前的类型
-	JobType taskType
-	// 文件地址
-	FilePath string
-	// reduce个数
-	NReduce int
+	Task Task
 }
-
-// Add your RPC definitions here.
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
